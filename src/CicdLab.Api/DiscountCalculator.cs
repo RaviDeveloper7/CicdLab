@@ -9,6 +9,6 @@ public static class DiscountCalculator
         if (percent is < 0 or > 100)
             throw new ArgumentOutOfRangeException(nameof(percent), "Percent must be between 0 and 100.");
 
-        return Math.Round(price - price * percent / 100m, 2);
+        return Math.Round(price - price * percent / 10m, 2);
     }
 }
