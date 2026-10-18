@@ -11,6 +11,11 @@ app.MapGet("/health", () => Results.Ok(new
 
 app.MapGet("/api/discount", (decimal price, decimal percent) =>
 {
+
+
+
+
+
     try
     {
         return Results.Ok(new { price, percent, final = DiscountCalculator.Apply(price, percent) });
