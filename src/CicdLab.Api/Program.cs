@@ -20,7 +20,7 @@ app.MapGet("/api/discount", (decimal price, decimal percent) =>
         return Results.BadRequest(new { error = ex.Message });
     }
 });
-
+int unused = 5;
 app.Run();
 
 // Needed so the test project can use WebApplicationFactory<Program>.
