@@ -1,0 +1,161 @@
+name: ci-cd
+
+on:
+  push:
+    branches: [main, "feature/**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_VERSION: "10.0.x"
+  DOTNET_NOLOGO: "true"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "true"
+  COVERAGE_GATE: "0.70"
+
+jobs:
+  # ---------- CI ----------
+  build:
+    name: 1 · Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+      - uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj') }}
+          restore-keys: nuget-${{ runner.os }}-
+      - run: dotnet restore src/CicdLab.Api
+      - run: dotnet build src/CicdLab.Api -c Release --no-restore
+
+  test:
+    name: 2 · Test
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+      - uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj') }}
+          restore-keys: nuget-${{ runner.os }}-
+      - name: Run tests with coverage
+        run: >
+          dotnet test tests/CicdLab.Tests -c Release
+          --collect:"XPlat Code Coverage" --results-directory ./coverage
+      - name: Coverage quality gate
+        run: |
+          file=$(find coverage -name coverage.cobertura.xml | head -n 1)
+          rate=$(grep -o 'line-rate="[0-9.]*"' "$file" | head -n 1 | grep -o '[0-9.]*')
+          echo "Line coverage: $rate (gate: $COVERAGE_GATE)"
+          awk -v r="$rate" -v g="$COVERAGE_GATE" 'BEGIN { exit (r >= g) ? 0 : 1 }' \
+            || { echo "::error::Line coverage $rate is below the $COVERAGE_GATE gate"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage/
+
+  package:
+    name: 3 · Package
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}:sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.image }}
+          build-args: APP_VERSION=${{ github.sha }}
+
+  # ---------- CD ----------
+  deploy-staging:
+    name: 4 · Deploy to Staging
+    needs: package
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Start the exact image that was packaged
+        run: docker run -d --name app -p 8080:8080 "${{ needs.package.outputs.image }}"
+      - name: Wait for health
+        run: |
+          for i in $(seq 1 20); do
+            curl -fs http://localhost:8080/health && exit 0
+            sleep 2
+          done
+          echo "::error::App never became healthy"; exit 1
+      - name: Smoke tests
+        run: |
+          curl -fs http://localhost:8080/health | grep -q Healthy
+          body=$(curl -fs "http://localhost:8080/api/discount?price=100&percent=10")
+          echo "$body"
+          echo "$body" | grep -Eq '"final":90(\.0+)?[,}]'
+      - name: Show container logs on failure
+        if: failure()
+        run: docker logs app
+
+  deploy-production:
+    name: 5 · Deploy to Production
+    needs: [package, deploy-staging]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # Add "Required reviewers" to this environment in repo settings
+    # => Continuous Delivery (manual approval). Remove them => Continuous Deployment.
+    environment: production
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Promote the same image (build once, deploy many)
+        run: |
+          image="${{ needs.package.outputs.image }}"
+          prod="ghcr.io/${GITHUB_REPOSITORY,,}:production"
+          docker pull "$image"
+          docker tag "$image" "$prod"
+          docker push "$prod"
+      - name: Post-deploy health check
+        run: |
+          docker run -d --name prod -p 8081:8080 "ghcr.io/${GITHUB_REPOSITORY,,}:production"
+          for i in $(seq 1 20); do
+            curl -fs http://localhost:8081/health && exit 0
+            sleep 2
+          done
+          echo "::error::Production health check failed (this is where you would roll back)"
+          docker logs prod; exit 1
