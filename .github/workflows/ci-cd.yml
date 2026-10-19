@@ -14,7 +14,7 @@ env:
   DOTNET_VERSION: "10.0.x"
   DOTNET_NOLOGO: "true"
   DOTNET_CLI_TELEMETRY_OPTOUT: "true"
-  COVERAGE_GATE: "0.70"
+  COVERAGE_GATE: "0.99"
 
 jobs:
   # ---------- CI ----------
